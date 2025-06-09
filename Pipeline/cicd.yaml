@@ -1,0 +1,375 @@
+#This pipeline is used for creating a infrastructure using Terraform in AWS.
+#We will have 5 task which are written in python. When ever we have chages in those task folders the pipeline should get triggered, create a new image, push it to ECR and run infra with updated code.
+#All 5 task folders contain Dockerfile to build the docker images and app.py for holding the python code.
+#Infra contains Bootstrap, Dev and Prod environment. 
+#Bootstrap contains the s3 which has .tfvars for both dev and prod env. It also contains tf script for creating the ECR which is used to store the images created for the 5 task folders
+# We will use Workspace method to create the infra in dev and prod which can help to use the code in multiple env's
+# Pipeline is triggerd on basis of pushing the code to either dev or prod.
+
+name: #Name of the pipeline
+
+on:
+  push:
+    branches: [dev, prod]
+    paths:
+      - #Select the location where the 5 folders are present.
+
+env:
+  AWS_REGION: #Select the region where you want to create the infra
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPO_PREFIX: #Replace with your project name so that you can have the reference of the image for which project it got created
+  TF_BOOTSTRAP_DIR: #<Location of the bootstrap enviromnet terraform script>
+  TF_INFRA_DIR: #<Location of the actual infra directory which has IAM,SG,ECS,Lambda,StepFunctions>
+  TF_DEV_VARS: #<Location for dev.tfvars file> Generally this should be present in actual infra folder not in bootstrap
+  TF_PROD_VARS: #<Location for prod.tfvars file> Generally this should be present in actual infra folder not in bootstrap
+
+jobs:
+  terraform-bootstrap-deploy:
+    if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for Bootstrap
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_BOOTSTRAP_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_BOOTSTRAP_DIR }}
+        run: terraform apply --auto-approve
+
+  
+  detect-changes:
+    needs: [terraform-bootstrap-deploy]
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed_tasks: ${{ steps.check.outputs.changed_tasks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get list of changed files
+        id: changed-files
+        run: |
+          files=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | tr '\n' ' ')
+          files="${files:-}"  # fallback to empty string
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Check which folders changed (optimized)
+        id: check
+        run: |
+          changed_folders=()
+          declare -A seen
+          files="${{ steps.changed-files.outputs.files }}"
+
+          if [[ -z "$files" ]]; then
+            echo "No changed files detected."
+            echo "changed_tasks=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for file in $files; do
+            if [[ "$file" == location/of/task1_folder/* && -z "${seen[task1_folder_name]}" ]]; then
+              changed_folders+=("task1_folder_name")
+              seen[task1_folder_name]=1
+            elif [[ "$file" == location/of/task2_folder/* && -z "${seen[task2_folder_name]}" ]]; then
+              changed_folders+=("task2_folder_name")
+              seen[task2_folder_name]=1
+            elif [[ "$file" == location/of/task3_folder/* && -z "${seen[task3_folder_name]}" ]]; then
+              changed_folders+=("task3_folder_name")
+              seen[task3_folder_name]=1
+            elif [[ "$file" == location/of/task4_folder/* && -z "${seen[task4_folder_name]}" ]]; then
+              changed_folders+=("task4_folder_name")
+              seen[task4_folder_name]=1
+            elif [[ "$file" == location/of/task5_folder/* && -z "${seen[task5_folder_name]}" ]]; then
+              changed_folders+=("task5_folder_name")
+              seen[task5_folder_name]=1
+            fi
+          done
+
+          echo "Detected folders: ${changed_folders[@]}"
+          json=$(printf '%s\n' "${changed_folders[@]}" | jq -R . | jq -s -c .)
+          echo "changed_tasks=$json" >> "$GITHUB_OUTPUT"
+
+      - name: Debug output
+        run: |
+              echo "Changed tasks: ${{ steps.check.outputs.changed_tasks }}"
+
+
+  build-push:
+    needs: [detect-changes]
+    if: ${{ fromJson(needs.detect-changes.outputs.changed_tasks)[0] != null }}
+    strategy:
+      matrix:
+        task: ${{ fromJson(needs.detect-changes.outputs.changed_tasks) }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Matrix Task
+        run: |
+          if [[ -z "${{ matrix.task }}" ]]; then
+            echo "ERROR: matrix.task is empty"
+            exit 1
+          fi
+
+      - name: Map Task Folder to ECR Repo
+        id: map-repo
+        run: |
+          declare -A repo_map
+          repo_map[task1_folder_name]="Task1_lambda_name"
+          repo_map[task2_folder_name]="Task2_ECS_name" #This is a ECS Task
+          repo_map[task3_folder_name]="Task3_lambda_name"
+          repo_map[task4_folder_name]="Task4_lambda_name"
+          repo_map[task5_folder_name]="Task5_ECS_name" #This is a ECS Task
+
+          task="${{ matrix.task }}"
+          repo="${repo_map[$task]}"
+
+          if [[ -z "$repo" ]]; then
+            echo "No ECR mapping found for task: $task"
+            exit 1
+          fi
+
+          echo "Mapped $task → $repo"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials for ECR
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 \
+          | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Build & Push Docker Image
+        run: |
+          VERSION=1.0.${{ github.run_number }}-${GITHUB_SHA::7}
+          REPO="${{ steps.map-repo.outputs.repo }}"
+          IMAGE_URI=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO_PREFIX }}/${REPO}:${VERSION}
+
+          echo "Building Docker image for task: ${{ matrix.task }} → $REPO"
+          docker build -t $IMAGE_URI property_data/${{ matrix.task }}
+          docker push $IMAGE_URI
+
+
+  update-versions:
+    needs: [detect-changes, build-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Update image versions in dev.tfvars
+      run: |
+        VERSION=1.0.${{ github.run_number }}-${GITHUB_SHA::7}
+        echo "Using version: $VERSION"
+
+        TFVARS_PATH="${{ env.TF_INFRA_DIR }}/${{ env.TF_DEV_VARS }}"
+
+        declare -A tfvar_map
+        tfvar_map[task1_name]="task1_lambda_image_version"
+        tfvar_map[task2_name]="task2_ecs_image_version"
+        tfvar_map[task3_name]="task3_lambda_image_version"
+        tfvar_map[task4_name]="task4_lambda_image_version"
+        tfvar_map[task5_name]="task5_ecs_task_image_version"
+
+        if [[ ! -f "$TFVARS_PATH" ]]; then
+          echo "ERROR: $TFVARS_PATH does not exist."
+          exit 1
+        fi
+
+        CHANGED_TASKS='${{ needs.detect-changes.outputs.changed_tasks }}'
+        mapfile -t tasks < <(echo "$CHANGED_TASKS" | jq -r '.[]')
+
+        for task in "${tasks[@]}"; do
+          var="${tfvar_map[$task]}"
+          if [[ -z "$var" ]]; then
+            echo "WARNING: No tfvar mapping found for task '$task'"
+            continue
+          fi
+
+          if grep -q "^${var} = " "$TFVARS_PATH"; then
+            echo "Updating $var to $VERSION"
+            sed -i "s|^${var} = \".*\"|${var} = \"${VERSION}\"|" "$TFVARS_PATH"
+          else
+            echo "ERROR: Expected variable '$var' not found in $TFVARS_PATH"
+            exit 1
+          fi
+        done
+
+    - name: Commit version updates to dev.tfvars
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add ${{ env.TF_INFRA_DIR }}/${{ env.TF_DEV_VARS }}
+        git commit -m "Update image versions in dev.tfvars" || echo "No changes to commit"
+        git push || echo "Nothing to push"
+
+
+  terraform-dev-deploy:
+    needs: [update-versions]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Configure AWS Credentials for Dev Infra
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+  
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+  
+      - name: Terraform Init
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: terraform init
+  
+      - name: Select or Create Workspace
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: |
+          terraform workspace select dev || terraform workspace new dev
+  
+      - name: Terraform Apply with dev.tfvars
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: |
+          terraform apply -var-file="${{ env.TF_DEV_VARS }}" --auto-approve
+
+  promote-to-prod:
+    if: github.ref == 'refs/heads/prod'
+    needs: [terraform-bootstrap-deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      should_deploy: ${{ steps.commit.outputs.should_deploy }}
+  
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+  
+      - name: Promote dev image versions to prod.tfvars
+        run: |
+          DEV_TFVARS="${{ env.TF_INFRA_DIR }}/${{ env.TF_DEV_VARS }}"
+          PROD_TFVARS="${{ env.TF_INFRA_DIR }}/${{ env.TF_PROD_VARS }}"
+  
+          echo "Promoting image versions from $DEV_TFVARS → $PROD_TFVARS"
+
+          if [[ ! -f "$PROD_TFVARS" ]]; then
+            echo "ERROR: $PROD_TFVARS does not exist. Please create it manually before promotion."
+            exit 1
+          fi
+  
+          declare -A tfvar_map
+          tfvar_map[task1_name]="task1_lambda_image_version"
+          tfvar_map[task2_name]="task2_ecs_image_version"
+          tfvar_map[task3_name]="task3_lambda_image_version"
+          tfvar_map[task4_name]="task4_lambda_image_version"
+          tfvar_map[task5_name]="task5_ecs_task_image_version"
+  
+          did_change=false
+
+          for task in "${!tfvar_map[@]}"; do
+            var="${tfvar_map[$task]}"
+            dev_version=$(grep "^${var} = " "$DEV_TFVARS" | cut -d'"' -f2)
+          
+            if [[ -z "$dev_version" ]]; then
+              echo "ERROR: $var not found in $DEV_TFVARS"
+              exit 1
+            fi
+          
+            if grep -q "^${var} = " "$PROD_TFVARS"; then
+              current=$(grep "^${var} = " "$PROD_TFVARS" | cut -d'"' -f2)
+              if [[ "$current" != "$dev_version" ]]; then
+                echo "Updating $var to \"$dev_version\""
+                sed -i "s|^${var} = \".*\"|${var} = \"${dev_version}\"|" "$PROD_TFVARS"
+                did_change=true
+              else
+                echo "$var is already up-to-date"
+              fi
+            else
+              echo "ERROR: $var not found in $PROD_TFVARS"
+              exit 1
+            fi
+          done
+  
+      - name: Commit promoted versions
+        id: commit
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add ${{ env.TF_INFRA_DIR }}/${{ env.TF_PROD_VARS }}
+      
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "Promote dev image versions to prod.tfvars"
+            git push
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  terraform-prod-deploy:
+    if: needs.promote-to-prod.outputs.should_deploy == 'true'
+    needs: [promote-to-prod]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Configure AWS Credentials for Prod Infra
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+  
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: terraform init
+  
+      - name: Select or Create Workspace
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: |
+          terraform workspace select prod || terraform workspace new prod
+  
+      - name: Terraform Apply with prod.tfvars
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: |
+          terraform apply -var-file="${{ env.TF_PROD_VARS }}" --auto-approve
+

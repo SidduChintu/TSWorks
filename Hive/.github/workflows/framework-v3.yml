@@ -1,0 +1,516 @@
+name: Framework Container
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Choose environment (dev/prod)"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-update:
+    name: Build Image and Update Task Definition
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        id: env-config
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          
+          if [ "$ENV" == "prod" ]; then
+            echo "account_id=${{ secrets.PRODUCTION_ACCOUNT_ID }}" >> $GITHUB_OUTPUT
+            echo "role_name=${{ secrets.PROD_ROLE_NAME }}" >> $GITHUB_OUTPUT
+            # Production network configuration
+            echo "subnets=${{ secrets.PROD_SUBNET_IDS }}" >> $GITHUB_OUTPUT
+            echo "security_groups=${{ secrets.PROD_SECURITY_GROUP_IDS }}" >> $GITHUB_OUTPUT
+            echo "assign_public_ip=${{ secrets.PROD_ASSIGN_PUBLIC_IP || 'ENABLED' }}" >> $GITHUB_OUTPUT
+          else
+            echo "account_id=${{ secrets.DEVELOPMENT_ACCOUNT_ID }}" >> $GITHUB_OUTPUT
+            echo "role_name=${{ secrets.DEV_ROLE_NAME }}" >> $GITHUB_OUTPUT
+            # Development network configuration
+            echo "subnets=${{ secrets.DEV_SUBNET_IDS }}" >> $GITHUB_OUTPUT
+            echo "security_groups=${{ secrets.DEV_SECURITY_GROUP_IDS }}" >> $GITHUB_OUTPUT
+            echo "assign_public_ip=${{ secrets.DEV_ASSIGN_PUBLIC_IP || 'ENABLED' }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Load infrastructure configuration
+        id: load-infra-config
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          INFRA_CONFIG_FILE="./secrets/framework/${ENV}/infra.env"
+          
+          echo "================================================================"
+          echo "  Loading Infrastructure Configuration"
+          echo "================================================================"
+          echo "Environment: $ENV"
+          echo "Config File: $INFRA_CONFIG_FILE"
+          echo ""
+          
+          if [ ! -f "$INFRA_CONFIG_FILE" ]; then
+            echo "ERROR: Infrastructure config file not found: $INFRA_CONFIG_FILE"
+            exit 1
+          fi
+          
+          # Load infrastructure configuration
+          while IFS='=' read -r key value || [ -n "$key" ]; do
+            # Skip empty lines and comments
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            
+            # Trim whitespace
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            
+            # Export to GITHUB_OUTPUT
+            echo "${key}=${value}" >> $GITHUB_OUTPUT
+            echo "  ✓ Loaded: $key"
+          done < "$INFRA_CONFIG_FILE"
+          
+          echo ""
+          echo "✓ Infrastructure configuration loaded successfully"
+
+      ########################################################################
+      # AWS Authentication - Environment Specific
+      ########################################################################
+      - name: Configure AWS Credentials for ${{ github.event.inputs.environment }} environment
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.env-config.outputs.account_id }}:role/${{ steps.env-config.outputs.role_name }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubOIDC-${{ github.event.inputs.environment }}
+
+      - name: Verify AWS Identity
+        run: |
+          echo "================================================================"
+          echo "  Authenticating to ${{ github.event.inputs.environment }} environment"
+          echo "================================================================"
+          aws sts get-caller-identity
+          echo ""
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tags
+        id: image-tags
+        run: |
+          # Environment-aware tags
+          ENV="${{ github.event.inputs.environment }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          
+          # Primary tags with environment prefix for timestamp (for lifecycle management)
+          echo "timestamp_tag=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "sha_tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          
+          # Use simple "latest" tag for task definition (same for all environments)
+          echo "latest_tag=latest" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.load-infra-config.outputs.ecr_repository }}
+          TIMESTAMP_TAG: ${{ steps.image-tags.outputs.timestamp_tag }}
+          LATEST_TAG: ${{ steps.image-tags.outputs.latest_tag }}
+        run: |
+          echo "================================================================"
+          echo "  Building image for ${{ github.event.inputs.environment }} environment"
+          echo "================================================================"
+          
+          # Build the Docker image with timestamp tag
+          docker build -f Dockerfile.framework -t $ECR_REGISTRY/$ECR_REPOSITORY:$TIMESTAMP_TAG .
+          
+          # Tag with "latest" (same for all environments)
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$TIMESTAMP_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$LATEST_TAG
+          
+          # Push both tags
+          echo "Pushing images to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TIMESTAMP_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$LATEST_TAG
+          
+          # Output the latest tag for task definition
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY" >> $GITHUB_OUTPUT
+          echo "timestamp_image=$ECR_REGISTRY/$ECR_REPOSITORY:$TIMESTAMP_TAG" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "✓ Image successfully pushed"
+          echo "   Timestamp Tag: $TIMESTAMP_TAG (for lifecycle tracking)"
+          echo "   Latest Tag: $LATEST_TAG (used in task definition)"
+
+      - name: Download current task definition
+        id: current-task-def
+        env:
+          TASK_DEFINITION_FAMILY: ${{ steps.load-infra-config.outputs.task_definition_family }}
+          CONTAINER_NAME: ${{ steps.load-infra-config.outputs.container_name }}
+        run: |
+          # Get current task definition
+          aws ecs describe-task-definition \
+            --task-definition $TASK_DEFINITION_FAMILY \
+            --query taskDefinition > task-definition.json
+          
+          # Extract current revision and image
+          CURRENT_REVISION=$(jq -r '.revision' task-definition.json)
+          CURRENT_IMAGE=$(jq -r --arg CONTAINER "$CONTAINER_NAME" \
+            '.containerDefinitions[] | select(.name == $CONTAINER) | .image' task-definition.json)
+          
+          echo "current_revision=$CURRENT_REVISION" >> $GITHUB_OUTPUT
+          echo "current_image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+          
+          # Clean task definition for registration
+          cat task-definition.json | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > task-def-clean.json
+
+      - name: Load application configuration
+        id: load-app-config
+        env:
+          ENV: ${{ github.event.inputs.environment }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          ACCOUNT_ID: ${{ steps.env-config.outputs.account_id }}
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          APP_CONFIG_FILE="./secrets/framework/${ENV}/secrets.env"
+          
+          echo "================================================================"
+          echo "  Loading Application Configuration"
+          echo "================================================================"
+          echo "Environment: $ENVIRONMENT"
+          echo "Config File: $APP_CONFIG_FILE"
+          echo ""
+          
+          if [ ! -f "$APP_CONFIG_FILE" ]; then
+            echo "ERROR: Application config file not found: $APP_CONFIG_FILE"
+            exit 1
+          fi
+          
+          # Parse application config file and create JSON arrays for environment variables and secrets
+          ENV_VARS='[]'
+          SECRETS='[]'
+          
+          while IFS='=' read -r key value || [ -n "$key" ]; do
+            # Skip empty lines and comments
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            
+            # Trim whitespace
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            
+            # Replace ACCOUNT_ID placeholder if present
+            value="${value//ACCOUNT_ID/$ACCOUNT_ID}"
+            
+            # Check if value looks like a Secrets Manager ARN
+            if [[ "$value" =~ ^arn:aws:secretsmanager: ]]; then
+              # This is a secret reference
+              SECRETS=$(echo "$SECRETS" | jq --arg name "$key" --arg arn "$value" '. += [{"name": $name, "valueFrom": $arn}]')
+              echo "  [SECRET] $key -> ${value:0:60}..."
+            else
+              # This is a regular environment variable
+              ENV_VARS=$(echo "$ENV_VARS" | jq --arg name "$key" --arg val "$value" '. += [{"name": $name, "value": $val}]')
+              echo "  [ENV] $key = $value"
+            fi
+          done < "$APP_CONFIG_FILE"
+          
+          # Save to outputs (escape for GitHub Actions)
+          echo "env_vars<<EOF" >> $GITHUB_OUTPUT
+          echo "$ENV_VARS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "secrets<<EOF" >> $GITHUB_OUTPUT
+          echo "$SECRETS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "✓ Application configuration loaded successfully"
+          echo "  Environment Variables: $(echo "$ENV_VARS" | jq 'length')"
+          echo "  Secrets: $(echo "$SECRETS" | jq 'length')"
+
+      - name: Update task definition with new image and configuration
+        env:
+          CONTAINER_NAME: ${{ steps.load-infra-config.outputs.container_name }}
+        run: |
+          echo "================================================================"
+          echo "  Updating task definition"
+          echo "================================================================"
+
+          # CRITICAL: Replace (not merge) environment variables and secrets
+          # This ensures old values are removed completely
+          
+          # Step 1: Update the container image
+          jq --arg IMAGE "${{ steps.build-image.outputs.image }}" \
+             --arg CONTAINER "$CONTAINER_NAME" \
+             '(.containerDefinitions[] | select(.name == $CONTAINER) | .image) = $IMAGE' \
+             task-def-clean.json > task-def-temp.json
+          
+          # Step 2: REPLACE environment variables and secrets completely
+          # This properly handles the containerDefinitions array structure
+          jq --arg CONTAINER "$CONTAINER_NAME" \
+             --argjson ENV_VARS '${{ steps.load-app-config.outputs.env_vars }}' \
+             --argjson SECRETS '${{ steps.load-app-config.outputs.secrets }}' \
+             '.containerDefinitions = [
+               .containerDefinitions[] | 
+               if .name == $CONTAINER then
+                 . + 
+                 (if ($ENV_VARS | length) > 0 then {environment: $ENV_VARS} else {} end) +
+                 (if ($SECRETS | length) > 0 then {secrets: $SECRETS} else {} end) |
+                 if ($ENV_VARS | length) == 0 then del(.environment) else . end |
+                 if ($SECRETS | length) == 0 then del(.secrets) else . end
+               else
+                 .
+               end
+             ]' \
+             task-def-temp.json > task-def-updated.json
+          
+          echo "✓ Task definition updated with:"
+          echo "  • New container image"
+          echo "  • Environment variables REPLACED from: ./secrets/framework/${{ github.event.inputs.environment }}/secrets.env"
+          echo "  • Secrets REPLACED from: ./secrets/framework/${{ github.event.inputs.environment }}/secrets.env"
+          echo "  • Old environment variables and secrets have been REMOVED"
+          echo ""
+          
+          # Display configuration summary
+          echo "Environment Variables Applied (from config file):"
+          jq -r --arg CONTAINER "$CONTAINER_NAME" \
+            '.containerDefinitions[] | select(.name == $CONTAINER) | .environment[]? | "  \(.name) = \(.value)"' \
+            task-def-updated.json || echo "  None"
+          echo ""
+          echo "Secrets Applied (from config file):"
+          jq -r --arg CONTAINER "$CONTAINER_NAME" \
+            '.containerDefinitions[] | select(.name == $CONTAINER) | .secrets[]? | "  \(.name) <- \(.valueFrom | .[0:70])..."' \
+            task-def-updated.json || echo "  None"
+          echo ""
+          
+          # Debug: Validate task definition structure
+          echo "Validating task definition structure..."
+          if jq -e '.containerDefinitions' task-def-updated.json > /dev/null; then
+            echo "✓ containerDefinitions array is valid"
+          else
+            echo "✗ ERROR: containerDefinitions structure is invalid"
+            exit 1
+          fi
+
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          echo "Registering new task definition for ${{ github.event.inputs.environment }} environment..."
+          
+          # Register the new task definition
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def-updated.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          NEW_REVISION=$(echo $TASK_DEF_ARN | rev | cut -d':' -f1 | rev)
+          
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "new_revision=$NEW_REVISION" >> $GITHUB_OUTPUT
+
+      - name: Display Deployment Summary
+        env:
+          ENV_UPPER: ${{ steps.env-config.outputs.env_prefix }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          ECR_REPOSITORY: ${{ steps.load-infra-config.outputs.ecr_repository }}
+          ECS_CLUSTER: ${{ steps.load-infra-config.outputs.ecs_cluster }}
+          TASK_DEFINITION_FAMILY: ${{ steps.load-infra-config.outputs.task_definition_family }}
+          ACCOUNT_ID: ${{ steps.load-infra-config.outputs.account_id }}
+          CONTAINER_NAME: ${{ steps.load-infra-config.outputs.container_name }}
+          ENV_FILE: ./secrets/framework/${{ github.event.inputs.environment }}/secrets.env
+        run: |
+          echo "================================================================"
+          echo "              DEPLOYMENT SUMMARY - ${{ github.event.inputs.environment }} ENVIRONMENT"
+          echo "================================================================"
+          echo ""
+          echo "  Environment: $ENVIRONMENT"
+          echo "  Configuration File: $ENV_FILE"
+          echo "  AWS Account: $ACCOUNT_ID"
+          echo "  Region: ${{ env.AWS_REGION }}"
+          echo ""
+          echo "================================================================"
+          echo "                 ECR IMAGE DETAILS"
+          echo "================================================================"
+          echo ""
+          echo "Repository: $ECR_REPOSITORY"
+          echo ""
+          echo "Tags Created:"
+          echo "  ├─ Timestamp: ${{ steps.image-tags.outputs.timestamp_tag }}"
+          echo "  └─ Latest:    ${{ steps.image-tags.outputs.latest_tag }}"
+          echo ""
+          echo "Full Image URI:"
+          echo "  Task Definition: ${{ steps.build-image.outputs.image }}"
+          echo "  Timestamp Reference: ${{ steps.build-image.outputs.timestamp_image }}"
+          echo ""
+          echo "================================================================"
+          echo "             TASK DEFINITION COMPARISON"
+          echo "================================================================"
+          echo ""
+          echo "Family: $TASK_DEFINITION_FAMILY"
+          echo "Cluster: $ECS_CLUSTER"
+          echo ""
+          echo "┌─────────────────────────────────────────────────────────────"
+          echo "│ PREVIOUS (Revision ${{ steps.current-task-def.outputs.current_revision }})"
+          echo "├─────────────────────────────────────────────────────────────"
+          echo "│ Image: ${{ steps.current-task-def.outputs.current_image }}"
+          echo "└─────────────────────────────────────────────────────────────"
+          echo ""
+          echo "┌─────────────────────────────────────────────────────────────"
+          echo "│ NEW (Revision ${{ steps.register-task-def.outputs.new_revision }})"
+          echo "├─────────────────────────────────────────────────────────────"
+          echo "│ Image: ${{ steps.build-image.outputs.image }}"
+          echo "└─────────────────────────────────────────────────────────────"
+          echo ""
+          echo "✓ Changes Applied:"
+          echo "  • Revision: ${{ steps.current-task-def.outputs.current_revision }} → ${{ steps.register-task-def.outputs.new_revision }}"
+          echo "  • Image Tag: latest (same for all environments)"
+          echo "  • Timestamp Build: ${{ steps.image-tags.outputs.timestamp_tag }} (preserved in ECR)"
+          echo "  • Configuration loaded from: $ENV_FILE"
+          echo "  • Environment Variables: REPLACED (not merged) ✓"
+          echo "  • Secrets: REPLACED (not merged) ✓"
+          echo "  • Old config values: REMOVED ✓"
+          echo ""
+          echo "================================================================"
+          echo "             ENVIRONMENT CONFIGURATION"
+          echo "================================================================"
+          echo ""
+          echo "Source: $ENV_FILE"
+          echo ""
+          # Extract and display environment variables from updated task definition
+          echo "Environment Variables (from config file):"
+          jq -r --arg CONTAINER "$CONTAINER_NAME" \
+            '.containerDefinitions[] | select(.name == $CONTAINER) | .environment[]? | "  \(.name) = \(.value)"' \
+            task-def-updated.json || echo "  No environment variables configured"
+          echo ""
+          echo "Secrets (from config file):"
+          jq -r --arg CONTAINER "$CONTAINER_NAME" \
+            '.containerDefinitions[] | select(.name == $CONTAINER) | .secrets[]? | "  \(.name) <- \(.valueFrom)"' \
+            task-def-updated.json || echo "  No secrets configured"
+          echo ""
+          echo "================================================================"
+          echo "             NETWORK CONFIGURATION"
+          echo "================================================================"
+          echo ""
+          echo "Subnets: ${{ steps.env-config.outputs.subnets }}"
+          echo "Security Groups: ${{ steps.env-config.outputs.security_groups }}"
+          echo "Assign Public IP: ${{ steps.env-config.outputs.assign_public_ip }}"
+          echo ""
+          echo "Note: Network configuration is stored for reference but"
+          echo "      must be specified when running tasks or updating services."
+          echo ""
+          echo "================================================================"
+          echo "                      NEXT STEPS"
+          echo "================================================================"
+          echo ""
+          echo "The task definition has been updated but NOT deployed."
+          echo ""
+          echo "To deploy the new version:"
+          echo "  1. Update your ECS service to use revision ${{ steps.register-task-def.outputs.new_revision }}"
+          echo "  2. Or manually run a task using the new task definition"
+          echo ""
+          echo "To update configuration:"
+          echo "  1. Edit $ENV_FILE in your repository"
+          echo "  2. Commit and push changes"
+          echo "  3. Run this workflow again"
+          echo ""
+          echo "To run a task manually with this configuration:"
+          echo "  aws ecs run-task \\"
+          echo "    --cluster $ECS_CLUSTER \\"
+          echo "    --task-definition $TASK_DEFINITION_FAMILY:${{ steps.register-task-def.outputs.new_revision }} \\"
+          echo "    --launch-type FARGATE \\"
+          echo "    --network-configuration \"awsvpcConfiguration={subnets=[${{ steps.env-config.outputs.subnets }}],securityGroups=[${{ steps.env-config.outputs.security_groups }}],assignPublicIp=${{ steps.env-config.outputs.assign_public_ip }}}\""
+          echo ""
+          echo "================================================================"
+          echo "                     AWS CONSOLE LINKS"
+          echo "================================================================"
+          echo ""
+          echo "Task Definition:"
+          echo "  https://${{ env.AWS_REGION }}.console.aws.amazon.com/ecs/v2/task-definitions/$TASK_DEFINITION_FAMILY/${{ steps.register-task-def.outputs.new_revision }}"
+          echo ""
+          echo "ECS Cluster:"
+          echo "  https://${{ env.AWS_REGION }}.console.aws.amazon.com/ecs/v2/clusters/$ECS_CLUSTER"
+          echo ""
+          echo "ECR Repository:"
+          echo "  https://${{ env.AWS_REGION }}.console.aws.amazon.com/ecr/repositories/private/$ACCOUNT_ID/$ECR_REPOSITORY"
+          echo ""
+          echo "Secrets Manager:"
+          echo "  https://${{ env.AWS_REGION }}.console.aws.amazon.com/secretsmanager/listsecrets?region=${{ env.AWS_REGION }}"
+          echo ""
+          echo "VPC Subnets:"
+          echo "  https://${{ env.AWS_REGION }}.console.aws.amazon.com/vpc/home?region=${{ env.AWS_REGION }}#subnets:"
+          echo ""
+          echo "Security Groups:"
+          echo "  https://${{ env.AWS_REGION }}.console.aws.amazon.com/vpc/home?region=${{ env.AWS_REGION }}#securityGroups:"
+          echo ""
+          echo "================================================================"
+
+      - name: Create deployment artifact
+        env:
+          ECR_REPOSITORY: ${{ steps.load-infra-config.outputs.ecr_repository }}
+          TASK_DEFINITION_FAMILY: ${{ steps.load-infra-config.outputs.task_definition_family }}
+          ECS_CLUSTER: ${{ steps.load-infra-config.outputs.ecs_cluster }}
+          ACCOUNT_ID: ${{ steps.env-config.outputs.account_id }}
+          ENV_FILE: ./secrets/framework/${{ github.event.inputs.environment }}/secrets.env
+        run: |
+          cat > deployment-info.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "environment": "${{ github.event.inputs.environment }}",
+            "config_file": "$ENV_FILE",
+            "aws_account_id": "$ACCOUNT_ID",
+            "aws_region": "${{ env.AWS_REGION }}",
+            "repository": "$ECR_REPOSITORY",
+            "image_tags": {
+              "primary": "latest",
+              "timestamp": "${{ steps.image-tags.outputs.timestamp_tag }}"
+            },
+            "task_definition": {
+              "family": "$TASK_DEFINITION_FAMILY",
+              "cluster": "$ECS_CLUSTER",
+              "previous_revision": "${{ steps.current-task-def.outputs.current_revision }}",
+              "new_revision": "${{ steps.register-task-def.outputs.new_revision }}",
+              "previous_image": "${{ steps.current-task-def.outputs.current_image }}",
+              "new_image": "${{ steps.build-image.outputs.image }}"
+            },
+            "network_configuration": {
+              "subnets": "${{ steps.env-config.outputs.subnets }}",
+              "security_groups": "${{ steps.env-config.outputs.security_groups }}",
+              "assign_public_ip": "${{ steps.env-config.outputs.assign_public_ip }}"
+            },
+            "git": {
+              "sha": "${{ github.sha }}",
+              "short_sha": "${{ steps.image-tags.outputs.sha_tag }}",
+              "ref": "${{ github.ref }}",
+              "branch": "${{ github.ref_name }}",
+              "actor": "${{ github.actor }}"
+            }
+          }
+          EOF
+          
+          echo "✓ Deployment information saved"
+          cat deployment-info.json
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info-${{ github.event.inputs.environment }}-${{ steps.image-tags.outputs.timestamp_tag }}
+          path: deployment-info.json
+          retention-days: 90
+
+      - name: Deployment Complete
+        run: |
+          echo ""
+          echo "✓ Deployment to ${{ github.event.inputs.environment }} environment completed successfully!"
+          echo ""
